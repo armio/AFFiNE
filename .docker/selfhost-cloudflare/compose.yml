@@ -1,0 +1,207 @@
+# AFFiNE self-hosted + Cloudflare (Tunnel + R2 + backups en R2)
+#
+# Todo el tráfico público entra por Cloudflare Tunnel (servicio `cloudflared`).
+# Ningún puerto se publica en el host. Redes:
+#   edge     cloudflared <-> affine (y salida a Internet para R2/SMTP)
+#   backend  affine/migraciones/backup <-> postgres/redis (interna, sin Internet)
+# cloudflared no puede llegar a Postgres ni a Redis aunque alguien añada una
+# ruta en el panel del Tunnel.
+#
+# Arranque típico (ver README.md):
+#   docker compose up -d affine           # base de datos, migraciones y servidor (sin Tunnel)
+#   ./scripts/create-admin.sh             # crea el primer administrador en local
+#   docker compose up -d                  # publica el Tunnel y activa los backups
+name: affine
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: 10m
+    max-file: '3'
+
+networks:
+  edge: {}
+  backend:
+    internal: true
+
+x-affine-image: &affine-image ghcr.io/toeverything/affine:${AFFINE_REVISION:-0.27.4}
+
+x-affine-runtime-env: &affine-runtime-env
+  DATABASE_URL: postgresql://${DB_USERNAME:-affine}:${DB_PASSWORD:?Define DB_PASSWORD en .env}@postgres:5432/${DB_DATABASE:-affine}
+  REDIS_SERVER_HOST: redis
+  DEPLOYMENT_TYPE: selfhosted
+  AFFINE_SERVER_EXTERNAL_URL: https://${AFFINE_DOMAIN:?Define AFFINE_DOMAIN en .env}
+  AFFINE_SERVER_HOST: ${AFFINE_DOMAIN}
+  AFFINE_SERVER_HTTPS: 'true'
+
+services:
+  # One-shot: genera config/config.json a partir de .env en cada arranque.
+  affine_config:
+    image: *affine-image
+    container_name: affine_config_job
+    entrypoint: ['node', '/opt/affine-cloudflare/render-config.mjs']
+    network_mode: none
+    volumes:
+      - ./config:/root/.affine/config
+      - ./scripts/render-config.mjs:/opt/affine-cloudflare/render-config.mjs:ro
+    environment:
+      AFFINE_DOMAIN: ${AFFINE_DOMAIN}
+      AFFINE_SERVER_NAME: ${AFFINE_SERVER_NAME:-AFFiNE}
+      AFFINE_STORAGE: ${AFFINE_STORAGE:-r2}
+      R2_ACCOUNT_ID: ${R2_ACCOUNT_ID:-}
+      R2_JURISDICTION: ${R2_JURISDICTION:-default}
+      R2_ACCESS_KEY_ID: ${R2_ACCESS_KEY_ID:-}
+      R2_SECRET_ACCESS_KEY: ${R2_SECRET_ACCESS_KEY:-}
+      R2_BUCKET_BLOBS: ${R2_BUCKET_BLOBS:-affine-blobs}
+      R2_BUCKET_AVATARS: ${R2_BUCKET_AVATARS:-affine-avatars}
+      R2_BUCKET_COPILOT: ${R2_BUCKET_COPILOT:-affine-copilot}
+      AFFINE_UPLOAD_SIGN_KEY: ${AFFINE_UPLOAD_SIGN_KEY:-}
+      MAILER_HOST: ${MAILER_HOST:-}
+      MAILER_PORT: ${MAILER_PORT:-465}
+      MAILER_USER: ${MAILER_USER:-}
+      MAILER_PASSWORD: ${MAILER_PASSWORD:-}
+      MAILER_SENDER: ${MAILER_SENDER:-}
+      AFFINE_ALLOW_SIGNUP: ${AFFINE_ALLOW_SIGNUP:-false}
+      AFFINE_ALLOW_OAUTH_SIGNUP: ${AFFINE_ALLOW_OAUTH_SIGNUP:-false}
+      AFFINE_COPILOT_ENABLED: ${AFFINE_COPILOT_ENABLED:-false}
+    restart: 'no'
+    logging: *logging
+
+  # One-shot: migraciones de base de datos (y genera config/private.key si no existe).
+  affine_migration:
+    image: *affine-image
+    container_name: affine_migration_job
+    command: ['sh', '-c', 'node ./scripts/self-host-predeploy.js']
+    networks: [backend, edge]
+    volumes:
+      - ./data/storage:/root/.affine/storage
+      - ./config:/root/.affine/config
+    environment: *affine-runtime-env
+    depends_on:
+      affine_config:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: 'no'
+    logging: *logging
+
+  affine:
+    image: *affine-image
+    container_name: affine_server
+    networks: [backend, edge]
+    # Sin `ports:` a propósito. AFFiNE confía en CF-Connecting-IP / X-Forwarded-For,
+    # así que solo debe ser alcanzable a través de cloudflared.
+    volumes:
+      # Solo se usa si R2 no está configurado (AFFINE_STORAGE=local).
+      - ./data/storage:/root/.affine/storage
+      - ./config:/root/.affine/config
+    environment: *affine-runtime-env
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      # `restart: true`: si `docker compose up -d` regenera config.json (porque
+      # cambiaste .env), Compose reinicia AFFiNE para que lea la nueva config.
+      affine_config:
+        condition: service_completed_successfully
+        restart: true
+      affine_migration:
+        condition: service_completed_successfully
+        restart: true
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3010/info').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 120s
+    restart: unless-stopped
+    logging: *logging
+
+  cloudflared:
+    image: cloudflare/cloudflared:${CLOUDFLARED_VERSION:-2026.11.1}
+    container_name: affine_cloudflared
+    command: ['tunnel', '--no-autoupdate', 'run']
+    networks: [edge]
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:?Define CLOUDFLARE_TUNNEL_TOKEN en .env}
+    depends_on:
+      affine:
+        condition: service_healthy
+    restart: unless-stopped
+    logging: *logging
+
+  postgres:
+    image: pgvector/pgvector:${PGVECTOR_TAG:-0.8.7-pg16}
+    container_name: affine_postgres
+    networks: [backend]
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+    environment:
+      POSTGRES_USER: ${DB_USERNAME:-affine}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: ${DB_DATABASE:-affine}
+      POSTGRES_INITDB_ARGS: '--data-checksums'
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    logging: *logging
+
+  redis:
+    image: redis:${REDIS_TAG:-7.4-alpine}
+    container_name: affine_redis
+    networks: [backend]
+    healthcheck:
+      test: ['CMD', 'redis-cli', '--raw', 'incr', 'ping']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    logging: *logging
+
+  # Backup diario cifrado (age) de Postgres y de config/private.key a un bucket R2.
+  backup:
+    build: ./backup
+    image: affine-cloudflare-backup:local
+    # Siempre se construye en local (es rápido con caché): `docker compose pull`
+    # lo ignora y los cambios en backup/*.sh se aplican con `up -d`.
+    pull_policy: build
+    container_name: affine_backup
+    command: ['schedule']
+    networks: [backend, edge]
+    volumes:
+      - ./config:/affine-config:ro
+    environment:
+      PGHOST: postgres
+      PGUSER: ${DB_USERNAME:-affine}
+      PGPASSWORD: ${DB_PASSWORD}
+      PGDATABASE: ${DB_DATABASE:-affine}
+      BACKUP_BUCKET: ${BACKUP_BUCKET:-affine-backups}
+      BACKUP_TIME: ${BACKUP_TIME:-07:00}
+      BACKUP_AGE_RECIPIENT: ${BACKUP_AGE_RECIPIENT:-}
+      BACKUP_R2_ACCESS_KEY_ID: ${BACKUP_R2_ACCESS_KEY_ID:-}
+      BACKUP_R2_SECRET_ACCESS_KEY: ${BACKUP_R2_SECRET_ACCESS_KEY:-}
+      BACKUP_R2_ENDPOINT: ${BACKUP_R2_ENDPOINT:-}
+      R2_ACCOUNT_ID: ${R2_ACCOUNT_ID:-}
+      R2_JURISDICTION: ${R2_JURISDICTION:-default}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      # "unhealthy" si no hay un backup correcto en las últimas 26 h.
+      test: ['CMD', '/usr/local/bin/entrypoint.sh', 'healthcheck']
+      interval: 10m
+      timeout: 10s
+      retries: 1
+      start_period: 2m
+    restart: unless-stopped
+    logging: *logging
