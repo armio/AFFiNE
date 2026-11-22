@@ -17,7 +17,7 @@ ADMIN_NAME="${2:-${ADMIN_NAME:-}}"
 
 if [ -z "$ADMIN_EMAIL" ]; then
   printf 'Correo del administrador: '
-  read -r ADMIN_EMAIL
+  IFS= read -r ADMIN_EMAIL
 fi
 
 if [ -z "${ADMIN_PASSWORD:-}" ]; then
@@ -28,9 +28,9 @@ if [ -z "${ADMIN_PASSWORD:-}" ]; then
   stty -echo
   trap 'stty echo' EXIT INT TERM
   printf 'Contraseña (8 a 32 caracteres): '
-  read -r ADMIN_PASSWORD
+  IFS= read -r ADMIN_PASSWORD
   printf '\nRepite la contraseña: '
-  read -r ADMIN_PASSWORD_CONFIRM
+  IFS= read -r ADMIN_PASSWORD_CONFIRM
   printf '\n'
   stty echo
   trap - EXIT INT TERM

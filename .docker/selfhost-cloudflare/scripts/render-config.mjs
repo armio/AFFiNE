@@ -11,8 +11,11 @@
 //   silencio y AFFiNE vuelve a guardar en disco local.
 // - Con usePresignedURL.enabled + signKey, el navegador sube los archivos a AFFiNE
 //   (/api/storage/upload y /api/storage/multipart, en partes de 5 MiB) y es AFFiNE
-//   quien escribe en R2. No hace falta CORS en el bucket y ninguna petición normal
-//   supera el límite de 100 MB del proxy de Cloudflare.
+//   quien escribe en R2, así que ninguna subida normal supera el límite de 100 MB
+//   del proxy de Cloudflare.
+// - Las DESCARGAS de blobs y archivos de Copilot (AFFiNE 0.27.4) responden con un
+//   302 a una URL prefirmada de R2, por lo que affine-blobs y affine-copilot
+//   necesitan la política CORS de r2-cors.json (ver README).
 // - Lo que se cambie en el panel /admin se guarda en Postgres y tiene prioridad
 //   sobre este archivo.
 
@@ -86,6 +89,9 @@ const config = {
   },
   auth: {
     allowSignup: bool('AFFINE_ALLOW_SIGNUP', false),
+    // Registro mediante un proveedor OAuth/OIDC configurado en /admin. Es un
+    // interruptor aparte: con allowSignup=false, OAuth seguiría creando cuentas.
+    allowSignupForOauth: bool('AFFINE_ALLOW_OAUTH_SIGNUP', false),
   },
   indexer: {
     enabled: true,
@@ -199,7 +205,7 @@ for (const warning of warnings) console.warn(`[render-config] AVISO: ${warning}`
 if (errors.length) {
   for (const error of errors) console.error(`[render-config] ERROR: ${error}`);
   console.error(
-    '[render-config] No se generó config.json. Corrige .env y vuelve a ejecutar `docker compose up -d`.'
+    '[render-config] No se generó config.json. Corrige .env y vuelve a ejecutar: docker compose run --rm affine_config && docker compose up -d'
   );
   process.exit(1);
 }
@@ -228,7 +234,10 @@ console.log(`[render-config]   URL pública:   https://${domain}`);
 console.log(`[render-config]   Archivos:      ${storageSummary}`);
 console.log(`[render-config]   Correo:        ${mailerSummary}`);
 console.log(
-  `[render-config]   Registro libre: ${config.auth.allowSignup ? 'sí' : 'no (el admin crea las cuentas)'}`
+  `[render-config]   Registro libre: ${config.auth.allowSignup ? 'sí' : 'no (el admin crea las cuentas)'}, vía OAuth: ${config.auth.allowSignupForOauth ? 'sí' : 'no'}`
+);
+console.log(
+  '[render-config]   (lo que se cambie en /admin se guarda en Postgres y tiene prioridad sobre este archivo)'
 );
 console.log(
   `[render-config]   Copilot (IA):  ${config.copilot.enabled ? 'activado' : 'desactivado'}`

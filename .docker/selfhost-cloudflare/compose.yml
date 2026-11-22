@@ -1,8 +1,11 @@
 # AFFiNE self-hosted + Cloudflare (Tunnel + R2 + backups en R2)
 #
 # Todo el tráfico público entra por Cloudflare Tunnel (servicio `cloudflared`).
-# Ningún puerto se publica en el host: AFFiNE (3010), Postgres y Redis solo son
-# accesibles dentro de la red interna de Docker.
+# Ningún puerto se publica en el host. Redes:
+#   edge     cloudflared <-> affine (y salida a Internet para R2/SMTP)
+#   backend  affine/migraciones/backup <-> postgres/redis (interna, sin Internet)
+# cloudflared no puede llegar a Postgres ni a Redis aunque alguien añada una
+# ruta en el panel del Tunnel.
 #
 # Arranque típico (ver README.md):
 #   docker compose up -d affine           # base de datos, migraciones y servidor (sin Tunnel)
@@ -15,6 +18,11 @@ x-logging: &logging
   options:
     max-size: 10m
     max-file: '3'
+
+networks:
+  edge: {}
+  backend:
+    internal: true
 
 x-affine-image: &affine-image ghcr.io/toeverything/affine:${AFFINE_REVISION:-0.27.4}
 
@@ -32,6 +40,7 @@ services:
     image: *affine-image
     container_name: affine_config_job
     entrypoint: ['node', '/opt/affine-cloudflare/render-config.mjs']
+    network_mode: none
     volumes:
       - ./config:/root/.affine/config
       - ./scripts/render-config.mjs:/opt/affine-cloudflare/render-config.mjs:ro
@@ -53,6 +62,7 @@ services:
       MAILER_PASSWORD: ${MAILER_PASSWORD:-}
       MAILER_SENDER: ${MAILER_SENDER:-}
       AFFINE_ALLOW_SIGNUP: ${AFFINE_ALLOW_SIGNUP:-false}
+      AFFINE_ALLOW_OAUTH_SIGNUP: ${AFFINE_ALLOW_OAUTH_SIGNUP:-false}
       AFFINE_COPILOT_ENABLED: ${AFFINE_COPILOT_ENABLED:-false}
     restart: 'no'
     logging: *logging
@@ -62,6 +72,7 @@ services:
     image: *affine-image
     container_name: affine_migration_job
     command: ['sh', '-c', 'node ./scripts/self-host-predeploy.js']
+    networks: [backend, edge]
     volumes:
       - ./data/storage:/root/.affine/storage
       - ./config:/root/.affine/config
@@ -79,6 +90,7 @@ services:
   affine:
     image: *affine-image
     container_name: affine_server
+    networks: [backend, edge]
     # Sin `ports:` a propósito. AFFiNE confía en CF-Connecting-IP / X-Forwarded-For,
     # así que solo debe ser alcanzable a través de cloudflared.
     volumes:
@@ -116,6 +128,7 @@ services:
     image: cloudflare/cloudflared:${CLOUDFLARED_VERSION:-2026.11.1}
     container_name: affine_cloudflared
     command: ['tunnel', '--no-autoupdate', 'run']
+    networks: [edge]
     environment:
       TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:?Define CLOUDFLARE_TUNNEL_TOKEN en .env}
     depends_on:
@@ -127,6 +140,7 @@ services:
   postgres:
     image: pgvector/pgvector:${PGVECTOR_TAG:-0.8.7-pg16}
     container_name: affine_postgres
+    networks: [backend]
     volumes:
       - ./data/postgres:/var/lib/postgresql/data
     environment:
@@ -145,6 +159,7 @@ services:
   redis:
     image: redis:${REDIS_TAG:-7.4-alpine}
     container_name: affine_redis
+    networks: [backend]
     healthcheck:
       test: ['CMD', 'redis-cli', '--raw', 'incr', 'ping']
       interval: 10s
@@ -153,12 +168,16 @@ services:
     restart: unless-stopped
     logging: *logging
 
-  # Backup diario de Postgres (pg_dump) y de config/private.key a un bucket R2.
+  # Backup diario cifrado (age) de Postgres y de config/private.key a un bucket R2.
   backup:
     build: ./backup
     image: affine-cloudflare-backup:local
+    # Siempre se construye en local (es rápido con caché): `docker compose pull`
+    # lo ignora y los cambios en backup/*.sh se aplican con `up -d`.
+    pull_policy: build
     container_name: affine_backup
     command: ['schedule']
+    networks: [backend, edge]
     volumes:
       - ./config:/affine-config:ro
     environment:
@@ -168,14 +187,21 @@ services:
       PGDATABASE: ${DB_DATABASE:-affine}
       BACKUP_BUCKET: ${BACKUP_BUCKET:-affine-backups}
       BACKUP_TIME: ${BACKUP_TIME:-07:00}
-      RCLONE_CONFIG_R2_TYPE: s3
-      RCLONE_CONFIG_R2_PROVIDER: ${BACKUP_RCLONE_PROVIDER:-Cloudflare}
-      RCLONE_CONFIG_R2_ENDPOINT: ${BACKUP_R2_ENDPOINT:-https://${R2_ACCOUNT_ID:-missing-account-id}.r2.cloudflarestorage.com}
-      RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${BACKUP_R2_ACCESS_KEY_ID:-}
-      RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${BACKUP_R2_SECRET_ACCESS_KEY:-}
-      RCLONE_CONFIG_R2_NO_CHECK_BUCKET: 'true'
+      BACKUP_AGE_RECIPIENT: ${BACKUP_AGE_RECIPIENT:-}
+      BACKUP_R2_ACCESS_KEY_ID: ${BACKUP_R2_ACCESS_KEY_ID:-}
+      BACKUP_R2_SECRET_ACCESS_KEY: ${BACKUP_R2_SECRET_ACCESS_KEY:-}
+      BACKUP_R2_ENDPOINT: ${BACKUP_R2_ENDPOINT:-}
+      R2_ACCOUNT_ID: ${R2_ACCOUNT_ID:-}
+      R2_JURISDICTION: ${R2_JURISDICTION:-default}
     depends_on:
       postgres:
         condition: service_healthy
+    healthcheck:
+      # "unhealthy" si no hay un backup correcto en las últimas 26 h.
+      test: ['CMD', '/usr/local/bin/entrypoint.sh', 'healthcheck']
+      interval: 10m
+      timeout: 10s
+      retries: 1
+      start_period: 2m
     restart: unless-stopped
     logging: *logging
